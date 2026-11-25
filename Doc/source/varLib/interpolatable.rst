@@ -61,6 +61,37 @@ The underweight check compares area against the geometric mean of the endpoint
 area magnitudes, preserving their common winding. A midpoint that reverses that
 winding is treated as a collapse, even if its absolute area has grown again.
 
+Sampled containment check
+-------------------------
+
+``--containment`` (also accepted as ``--check-containment``) enables an opt-in
+geometric check for outlines that are hidden inside another contour at every
+master but protrude through it at an intermediate interpolation position
+(`issue #3562 <https://github.com/fonttools/fonttools/issues/3562>`_).
+
+For each compared master pair, pairwise contour relations (contained in one
+direction, disjoint, transversely intersecting, or coincident/shared boundary)
+are computed at the two explicit master endpoints and at a bounded set of
+intermediate fractions. The nominal midpoint is sampled by default;
+``--containment-samples N`` selects ``N`` evenly spaced interior positions
+(``N=1`` is the midpoint, values are capped at 9). A
+``contour_containment`` problem is reported when a pair is contained in the
+same direction at both masters but fails that containment at a sample (it
+crosses or becomes disjoint); a ``contour_intersection`` problem is reported
+when a pair newly crosses at a sample while not crossing at either master.
+Reports name the glyph, both contour indices (the conventional ``contour``
+field gives the inner/moving contour for containment failures), the sample
+fraction and its normalized axis location.
+
+Curves are flattened to bounded polygons and comparisons use a UPEM-derived
+coordinate tolerance so tessellation error and coincident/shared edges do not
+create false crossings. Empty, open, degenerate or component-only contours
+are skipped, and per-pair edge work has a fixed budget.
+
+This is a finite, explicitly sampled check: it can locate and repeatably
+demonstrate this class of defect, but a clean report does **not** prove that
+the whole continuous interpolation space is free of containment failures.
+
 .. automodule:: fontTools.varLib.interpolatable
    :members:
    :undoc-members:

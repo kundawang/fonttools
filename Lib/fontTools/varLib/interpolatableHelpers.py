@@ -140,6 +140,17 @@ class InterpolatableProblem:
     KINK = "kink"
     UNDERWEIGHT = "underweight"
     OVERWEIGHT = "overweight"
+    CONTOUR_CONTAINMENT = "contour_containment"
+    CONTOUR_INTERSECTION = "contour_intersection"
+
+    # Naming aliases used by callers and earlier drafts of this check. They
+    # intentionally share the canonical report strings above.
+    CONTAINMENT = CONTOUR_CONTAINMENT
+    CONTOUR_ESCAPE = CONTOUR_CONTAINMENT
+    ESCAPE = CONTOUR_CONTAINMENT
+    CONTOUR_OVERLAP = CONTOUR_INTERSECTION
+    OVERLAP = CONTOUR_INTERSECTION
+    INTERSECTION = CONTOUR_INTERSECTION
 
     severity = {
         MISSING: 1,
@@ -153,6 +164,8 @@ class InterpolatableProblem:
         UNDERWEIGHT: 9,
         OVERWEIGHT: 10,
         NOTHING: 11,
+        CONTOUR_CONTAINMENT: 12,
+        CONTOUR_INTERSECTION: 13,
     }
 
 

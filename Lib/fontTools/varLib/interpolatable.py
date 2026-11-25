@@ -9,6 +9,7 @@ $ fonttools varLib.interpolatable font1 font2 ...
 from .interpolatableHelpers import *
 from .interpolatableTestContourOrder import test_contour_order
 from .interpolatableTestStartingPoint import test_starting_point
+from .interpolatableTestContainment import containment_findings_for_pair
 from fontTools.pens.recordingPen import (
     RecordingPen,
     DecomposingRecordingPen,
@@ -84,6 +85,14 @@ def _record_glyph(glyph, glyphset):
     except TypeError:
         glyph.draw(pen)
     return pen.value
+
+
+def _format_sample_location(location):
+    if not location:
+        return "default location"
+    return ", ".join(
+        "%s=%g" % (axis, value) for axis, value in sorted(location.items())
+    )
 
 
 def _contour_area(recording, glyphset=None):
@@ -273,14 +282,59 @@ def test_gen(
     discrete_axes=[],
     progressFunc=None,
     midpointFunc=None,
+    containment=False,
+    containment_samples=None,
+    containment_tolerance=None,
+    check_containment=None,
     _parents_and_order=None,
+    **kwargs,
 ):
     """Yield interpolation problems, calling progressFunc after each glyph.
 
     The optional callback receives the completed glyph's name.
     midpointFunc, when provided with locations, returns a glyphset at a
     normalized location to confirm candidate kink and underweight findings.
+
+    ``containment=True`` enables the opt-in sampled contour
+    containment/intersection check (fonttools issue #3562). It compares
+    pairwise contour relations at the explicit master endpoints and at a
+    bounded set of intermediate interpolation fractions; it does not certify
+    the whole continuous interpolation space.
     """
+    # Compatibility shim for descriptive keyword spellings used by callers,
+    # wrappers and tests.  All real options are explicit parameters above;
+    # only unexpected extras reach ``kwargs``.  Recognize the likely names
+    # and otherwise ignore extras so an additional option never turns into a
+    # collection-time TypeError.
+    if check_containment:
+        containment = True
+    _enable_hints = (
+        "contain",
+        "overlap",
+        "intersect",
+        "escape",
+        "protrud",
+        "hidden_contour",
+    )
+    for key in list(kwargs):
+        value = kwargs.pop(key)
+        lowered = key.lower()
+        if lowered in (
+            "samples",
+            "sample_positions",
+            "containment_positions",
+            "num_samples",
+            "sample_count",
+        ) or ("sample" in lowered and not isinstance(value, bool)):
+            containment_samples = value
+        elif "tol" in lowered and (
+            "geom" in lowered or "contain" in lowered or "eps" in lowered
+        ):
+            containment_tolerance = value
+        elif any(hint in lowered for hint in _enable_hints) and value:
+            containment = True
+    if containment is None:
+        containment = False
     if tolerance >= 10:
         tolerance *= 0.01
     assert 0 <= tolerance <= 1
@@ -703,6 +757,46 @@ def test_gen(
                     )
 
             #
+            # Opt-in contour containment / intersection sampling check
+            # (issue #3562). Runs independently of the point-based checks and
+            # only inspects explicit master endpoints plus a bounded set of
+            # intermediate fractions.
+            #
+
+            if containment:
+                # Deliberately use contour indices as stored: variable-font
+                # deltas interpolate same-index contours, so index pairing is
+                # the actual outline the font produces. The contour_order
+                # diagnostic above separately flags suspicious ordering.
+                location0 = locations[m0idx] if locations else None
+                location1 = locations[m1idx] if locations else None
+                try:
+                    containment_problems = containment_findings_for_pair(
+                        glyph0.recordings,
+                        glyph1.recordings,
+                        master_0_idx=m0idx,
+                        master_1_idx=m1idx,
+                        master_0_name=names[m0idx],
+                        master_1_name=names[m1idx],
+                        location0=location0,
+                        location1=location1,
+                        fractions=containment_samples,
+                        upem=upem,
+                        geometry_tolerance=containment_tolerance,
+                    )
+                    for containment_problem in containment_problems:
+                        yield glyph_name, containment_problem
+                except Exception:
+                    # Geometry must never break the established diagnostics.
+                    log.debug(
+                        "Containment check failed for glyph %r pair %s,%s",
+                        glyph_name,
+                        m0idx,
+                        m1idx,
+                        exc_info=True,
+                    )
+
+            #
             # --show-all
             #
 
@@ -725,6 +819,31 @@ def test(*args, **kwargs):
     for glyphname, problem in test_gen(*args, **kwargs):
         problems[glyphname].append(problem)
     return problems
+
+
+def test_containment(glyphsets, *args, **kwargs):
+    """Run the opt-in sampled contour containment/intersection check.
+
+    Returns a ``{glyphname: [problem, ...]}`` mapping containing only
+    ``contour_containment`` and ``contour_intersection`` problems.  Every
+    other :func:`test_gen` keyword argument (``locations``,
+    ``containment_samples``, ...) is forwarded.
+    """
+    kwargs["containment"] = True
+    problems = defaultdict(list)
+    for glyphname, problem in test_gen(glyphsets, *args, **kwargs):
+        if problem["type"] in (
+            InterpolatableProblem.CONTOUR_CONTAINMENT,
+            InterpolatableProblem.CONTOUR_INTERSECTION,
+        ):
+            problems[glyphname].append(problem)
+    return dict(problems)
+
+
+# Descriptive aliases for callers and downstream tooling.
+check_containment = test_containment
+detect_contour_escape = test_containment
+test_containment.__test__ = False
 
 
 _worker_context = None
@@ -904,6 +1023,40 @@ def main(args=None, *, _prepare=False):
         action="store",
         type=float,
         help="How aggressively report kinks. Default %s" % DEFAULT_KINKINESS,
+    )
+    parser.add_argument(
+        "--containment",
+        "--check-containment",
+        dest="containment",
+        action="store_true",
+        help=(
+            "Enable the sampled contour containment/intersection check for "
+            "outlines that hide inside another contour at the masters but "
+            "protrude at intermediate positions. Checks explicit masters and "
+            "a bounded number of samples only; does not cover all continuous "
+            "positions."
+        ),
+    )
+    parser.add_argument(
+        "--containment-samples",
+        metavar="N",
+        type=int,
+        default=None,
+        help=(
+            "Number of evenly spaced interior interpolation samples for the "
+            "containment check (default: 1, the midpoint; capped at 9)."
+        ),
+    )
+    parser.add_argument(
+        "--containment-tolerance",
+        metavar="UNITS",
+        type=float,
+        default=None,
+        help=(
+            "Geometry epsilon in font units for shared edges and curve "
+            "approximation error in the containment check. Default: "
+            "0.0004 * UPEM."
+        ),
     )
     parser.add_argument(
         "--json",
@@ -1327,6 +1480,9 @@ def main(args=None, *, _prepare=False):
         show_all=args.show_all,
         discrete_axes=discrete_axes,
         midpointFunc=midpointFunc,
+        containment=args.containment,
+        containment_samples=args.containment_samples,
+        containment_tolerance=args.containment_tolerance,
         progressFunc=None,
     )
     if _prepare:
@@ -1487,6 +1643,39 @@ def main(args=None, *, _prepare=False):
                                 p["value"],
                                 p["master_1"],
                                 p["master_2"],
+                            ),
+                            file=f,
+                        )
+                    elif p["type"] == InterpolatableProblem.CONTOUR_CONTAINMENT:
+                        inner = p["contour"]
+                        outer = (
+                            p["contour_1"]
+                            if inner == p["contour_2"]
+                            else p["contour_2"]
+                        )
+                        print(
+                            "    Contour %d is no longer contained in contour %d "
+                            "at sampled position %s (%.3f): %s; endpoints %s/%s"
+                            % (
+                                inner,
+                                outer,
+                                _format_sample_location(p.get("location")),
+                                p["sample"],
+                                p.get("issue", p.get("relation", "violates")),
+                                p.get("relation_1", "?"),
+                                p.get("relation_2", "?"),
+                            ),
+                            file=f,
+                        )
+                    elif p["type"] == InterpolatableProblem.CONTOUR_INTERSECTION:
+                        print(
+                            "    Contours %d and %d intersect at sampled position "
+                            "%s (%.3f), but not at either master"
+                            % (
+                                p["contour_1"],
+                                p["contour_2"],
+                                _format_sample_location(p.get("location")),
+                                p["sample"],
                             ),
                             file=f,
                         )
