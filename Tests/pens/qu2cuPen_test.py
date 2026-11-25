@@ -30,6 +30,89 @@ except ImportError as e:
 MAX_ERR = 1.0
 
 
+def _midpoint(a, b):
+    return ((a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5)
+
+
+def _eval_quadratic(p0, p1, p2, t):
+    mt = 1 - t
+    return (
+        mt * mt * p0[0] + 2 * mt * t * p1[0] + t * t * p2[0],
+        mt * mt * p0[1] + 2 * mt * t * p1[1] + t * t * p2[1],
+    )
+
+
+def _eval_cubic(p0, p1, p2, p3, t):
+    mt = 1 - t
+    return (
+        mt**3 * p0[0] + 3 * mt * mt * t * p1[0] + 3 * mt * t * t * p2[0] + t**3 * p3[0],
+        mt**3 * p0[1] + 3 * mt * mt * t * p1[1] + 3 * mt * t * t * p2[1] + t**3 * p3[1],
+    )
+
+
+def _quad_blob_reference(offcurves, samples):
+    """Dense points tracing the TrueType geometry of a contour made entirely
+    of off-curve points, using the implicit on-curve midpoint rule."""
+    n = len(offcurves)
+    start = _midpoint(offcurves[-1], offcurves[0])
+    points = []
+    previous = start
+    for i in range(n):
+        on = _midpoint(offcurves[i], offcurves[(i + 1) % n])
+        for j in range(samples):
+            points.append(_eval_quadratic(previous, offcurves[i], on, j / samples))
+        previous = on
+    points.append(start)
+    return start, points
+
+
+def _recorded_points(recording, samples):
+    """Dense geometric points of a recorded cubic path, chaining each
+    segment from the end point of the previous one."""
+    points = []
+    current = None
+    for op, args in recording:
+        if op == "moveTo":
+            current = args[0]
+            points.append(current)
+        elif op == "lineTo":
+            for j in range(1, samples + 1):
+                t = j / samples
+                points.append(
+                    (
+                        current[0] + t * (args[0][0] - current[0]),
+                        current[1] + t * (args[0][1] - current[1]),
+                    )
+                )
+            current = args[0]
+        elif op == "curveTo":
+            p1, p2, p3 = args
+            for j in range(1, samples + 1):
+                points.append(_eval_cubic(current, p1, p2, p3, j / samples))
+            current = p3
+        elif op == "qCurveTo":
+            raise AssertionError("all_cubic output must not contain qCurveTo")
+    return points
+
+
+def _hausdorff(a, b):
+    def one_way(x, y):
+        return max(
+            min((px[0] - qx[0]) ** 2 + (px[1] - qx[1]) ** 2 for qx in y) ** 0.5
+            for px in x
+        )
+
+    return max(one_way(a, b), one_way(b, a))
+
+
+def _convert(contour, max_err=MAX_ERR, **kwargs):
+    outPen = RecordingPen()
+    pen = Qu2CuPen(outPen, max_err, all_cubic=True, **kwargs)
+    for op, args in contour:
+        getattr(pen, op)(*args)
+    return outPen
+
+
 class _TestPenMixin(object):
     """Collection of tests that are shared by both the SegmentPen and the
     PointPen test cases, plus some helper methods.
@@ -247,6 +330,174 @@ class TestQu2CuPen(unittest.TestCase, _TestPenMixin):
         print(outPen.value)
 
         assert not any(typ == "qCurveTo" for typ, _ in outPen.value)
+
+    # A fixed contour made entirely of off-curve points (a TrueType "quad
+    # blob"), used by the tests below.
+    OFFCURVES = [(0, 100), (100, 200), (300, 200), (400, 100), (300, 0), (100, 0)]
+
+    def test_all_cubic_offcurve_only(self):
+        contour = [
+            ("qCurveTo", tuple(self.OFFCURVES) + (None,)),
+            ("closePath", ()),
+        ]
+        outPen = _convert(contour)
+
+        # The output uses only cubic curves and starts at the implied
+        # on-curve point between the last and first off-curve points.
+        implied_start = _midpoint(self.OFFCURVES[-1], self.OFFCURVES[0])
+        assert outPen.value[0] == ("moveTo", (implied_start,))
+        assert not any(op == "qCurveTo" for op, _ in outPen.value)
+        assert outPen.value[-1] == ("closePath", ())
+
+        # One cubic per original quadratic segment: no off-curve point lost.
+        curves = [args for op, args in outPen.value if op == "curveTo"]
+        assert len(curves) == len(self.OFFCURVES)
+        # The last cubic closes exactly back on the implied start point.
+        assert curves[-1][-1] == implied_start
+
+        # The cubic geometry matches the original quadratic path within the
+        # requested error (here the elevation is exact, up to rounding).
+        _, reference = _quad_blob_reference(self.OFFCURVES, 120)
+        sampled = _recorded_points(outPen.value, 120)
+        assert _hausdorff(reference, sampled) < 1e-9
+
+    def test_all_cubic_offcurve_only_within_tolerance(self):
+        contour = [
+            ("qCurveTo", tuple(self.OFFCURVES) + (None,)),
+            ("closePath", ()),
+        ]
+        for max_err in (0.1, 0.5, 1.0, 2.0):
+            outPen = _convert(contour, max_err=max_err)
+            _, reference = _quad_blob_reference(self.OFFCURVES, 200)
+            sampled = _recorded_points(outPen.value, 200)
+            # Dense sampling introduces a small discretization floor on top of
+            # the true approximation error, hence the modest extra slack.
+            assert _hausdorff(reference, sampled) <= max_err + 0.25
+
+    def test_all_cubic_offcurve_only_minimum_points(self):
+        for n in (1, 2, 3, 4):
+            offcurves = [(100 * i, 50 * (i % 2)) for i in range(n)]
+            contour = [
+                ("qCurveTo", tuple(offcurves) + (None,)),
+                ("closePath", ()),
+            ]
+            outPen = _convert(contour)
+
+            implied_start = _midpoint(offcurves[-1], offcurves[0])
+            assert outPen.value[0] == ("moveTo", (implied_start,))
+            curves = [args for op, args in outPen.value if op == "curveTo"]
+            assert len(curves) == n
+            assert curves[-1][-1] == implied_start
+
+            _, reference = _quad_blob_reference(offcurves, 120)
+            assert _hausdorff(reference, _recorded_points(outPen.value, 120)) < 1e-9
+
+    def test_all_cubic_offcurve_only_duplicate_points(self):
+        # Consecutive duplicate off-curve points, including a fully
+        # degenerate contour, must not crash and must stay within tolerance.
+        offcurves = [
+            (0, 0),
+            (0, 0),
+            (100, 0),
+            (100, 100),
+            (100, 100),
+            (0, 100),
+        ]
+        contour = [("qCurveTo", tuple(offcurves) + (None,)), ("closePath", ())]
+        outPen = _convert(contour)
+        curves = [args for op, args in outPen.value if op == "curveTo"]
+        assert len(curves) == len(offcurves)  # every point preserved
+        _, reference = _quad_blob_reference(offcurves, 120)
+        assert _hausdorff(reference, _recorded_points(outPen.value, 120)) < 1e-9
+
+        # All points identical: every elevated cubic is a single point.
+        same = [(5, 5)] * 4
+        outPen = _convert([("qCurveTo", tuple(same) + (None,)), ("closePath", ())])
+        assert not any(op == "qCurveTo" for op, _ in outPen.value)
+        assert all(
+            pt == (5, 5) for op, args in outPen.value if op == "curveTo" for pt in args
+        )
+
+    def test_all_cubic_offcurve_only_reverse_direction(self):
+        contour = [
+            ("qCurveTo", tuple(self.OFFCURVES) + (None,)),
+            ("closePath", ()),
+        ]
+        forward = _convert(contour)
+        reversed_pen = _convert(contour, reverse_direction=True)
+
+        implied_start = _midpoint(self.OFFCURVES[-1], self.OFFCURVES[0])
+        # Reversing keeps the same starting point ...
+        assert reversed_pen.value[0] == ("moveTo", (implied_start,))
+        # ... but traverses the contour in the opposite order.
+        forward_points = _recorded_points(forward.value, 120)
+        reversed_points = _recorded_points(reversed_pen.value, 120)
+        length = min(len(forward_points), len(reversed_points))
+        order_diff = max(
+            (
+                (forward_points[i][0] - reversed_points[i][0]) ** 2
+                + (forward_points[i][1] - reversed_points[i][1]) ** 2
+            )
+            ** 0.5
+            for i in range(1, length - 1)
+        )
+        assert order_diff > 10 * MAX_ERR
+        # ... while describing the exact same geometry.
+        _, reference = _quad_blob_reference(self.OFFCURVES, 120)
+        assert _hausdorff(reference, reversed_points) < 1e-9
+
+    def test_all_cubic_offcurve_only_multiple_contours(self):
+        contours = [
+            [("qCurveTo", tuple(self.OFFCURVES) + (None,)), ("closePath", ())],
+            [
+                ("moveTo", ((10, 10),)),
+                ("qCurveTo", ((20, 20), (30, 10))),
+                ("lineTo", ((40, 40),)),
+                ("closePath", ()),
+            ],
+            [
+                ("qCurveTo", ((0, 0), (10, 0), (10, 10), None)),
+                ("closePath", ()),
+            ],
+        ]
+        outPen = RecordingPen()
+        pen = Qu2CuPen(outPen, MAX_ERR, all_cubic=True)
+        for contour in contours:
+            for op, args in contour:
+                getattr(pen, op)(*args)
+
+        # Three separate contours, none containing quadratic output.
+        assert sum(1 for op, _ in outPen.value if op == "moveTo") == 3
+        assert not any(op == "qCurveTo" for op, _ in outPen.value)
+
+        # Each quad blob keeps its own implied starting point.
+        assert outPen.value[0] == (
+            "moveTo",
+            (_midpoint(self.OFFCURVES[-1], self.OFFCURVES[0]),),
+        )
+        assert ("moveTo", ((5.0, 5.0),)) in outPen.value
+
+    def test_offcurve_only_passthrough_when_not_all_cubic(self):
+        # Without all_cubic, an oncurve-less contour is passed through
+        # unchanged, preserving the previous behavior.
+        contour = [
+            ("qCurveTo", tuple(self.OFFCURVES) + (None,)),
+            ("closePath", ()),
+        ]
+        outPen = RecordingPen()
+        pen = Qu2CuPen(outPen, MAX_ERR)
+        for op, args in contour:
+            getattr(pen, op)(*args)
+        assert outPen.value == contour
+
+    def test_all_cubic_offcurve_only_stats(self):
+        stats = {}
+        outPen = RecordingPen()
+        pen = Qu2CuPen(outPen, MAX_ERR, all_cubic=True, stats=stats)
+        pen.qCurveTo(*(self.OFFCURVES + [None]))
+        pen.closePath()
+        # Each emitted cubic has two off-curve controls -> key "2".
+        assert stats == {"2": len(self.OFFCURVES)}
 
 
 if __name__ == "__main__":

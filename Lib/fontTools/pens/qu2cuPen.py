@@ -60,18 +60,61 @@ class Qu2CuPen(ContourFilterPen):
             else:
                 yield ("qCurveTo", curve[1:])
 
+    def _offcurve_only_contour(self, args):
+        """Convert a closed contour made entirely of off-curve points.
+
+        Such a contour is drawn with a single ``qCurveTo`` whose final
+        argument is ``None``.  The on-curve points are only implied: each is
+        the midpoint of two consecutive off-curve points, and the contour
+        starts at the midpoint between the last and the first off-curve
+        points.  We make the implied start point explicit with a ``moveTo``
+        and feed one quadratic spline per implied on-curve segment to
+        :func:`quadratic_to_curves`, so no point is dropped and the contour
+        direction is preserved.
+        """
+        offcurves = args[:-1]
+        n = len(offcurves)
+
+        # Implied on-curve start point, halfway between the last and the
+        # first off-curve points.
+        first = offcurves[0]
+        last = offcurves[-1]
+        start = ((last[0] + first[0]) * 0.5, (last[1] + first[1]) * 0.5)
+        yield ("moveTo", (start,))
+
+        # Each quadratic spline runs from one implied on-curve point to the
+        # next, with the off-curve point in between as its control point.
+        quadratics = []
+        previous = start
+        for i in range(n):
+            off = offcurves[i]
+            nxt = offcurves[(i + 1) % n]
+            on = ((off[0] + nxt[0]) * 0.5, (off[1] + nxt[1]) * 0.5)
+            quadratics.append((previous, off, on))
+            previous = on
+
+        yield from self._quadratics_to_curve(quadratics)
+
     def filterContour(self, contour):
         quadratics = []
         currentPt = None
         newContour = []
         for op, args in contour:
-            if op == "qCurveTo" and (
+            if op == "qCurveTo" and args[-1] is None:
+                # A closed contour consisting entirely of off-curve points.
+                # Flush any pending quadratic runs first.
+                if quadratics:
+                    newContour.extend(self._quadratics_to_curve(quadratics))
+                    quadratics = []
+                if self.all_cubic:
+                    newContour.extend(self._offcurve_only_contour(args))
+                else:
+                    # No cubic conversion requested; pass the quad blob
+                    # through unchanged.
+                    newContour.append((op, args))
+            elif op == "qCurveTo" and (
                 self.all_cubic or (len(args) > 2 and args[-1] is not None)
             ):
-                if args[-1] is None:
-                    raise NotImplementedError(
-                        "oncurve-less contours with all_cubic not implemented"
-                    )
                 quadratics.append((currentPt,) + args)
             else:
                 if quadratics:
