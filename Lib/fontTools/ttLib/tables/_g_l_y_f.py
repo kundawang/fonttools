@@ -26,6 +26,7 @@ import array
 import logging
 import math
 import os
+import weakref
 from fontTools.misc import xmlWriter
 from fontTools.misc.filenames import userNameToFileName
 from fontTools.misc.loggingTools import deprecateFunction
@@ -99,6 +100,14 @@ class table__g_l_y_f(DefaultTable.DefaultTable):
     extended = False
 
     def decompile(self, data, ttFont):
+        # Register a non-owning back-reference so Glyph.getCoordinates() /
+        # recalcBounds() can reach a sibling VARC table. It is kept in the
+        # module-level _glyfVARCBridge registry (not as a table instance
+        # attribute) because the merger introspects every table's vars().
+        try:
+            _registerGlyfFont(self, ttFont)
+        except Exception:  # pragma: no cover - bridging is best-effort
+            pass
         loca = ttFont[self.locaTag]
         pos = int(loca[0])
         nextPos = 0
@@ -454,7 +463,7 @@ class table__g_l_y_f(DefaultTable.DefaultTable):
                 ],
             )
         else:
-            coords, endPts, flags = glyph.getCoordinates(self)
+            coords, endPts, flags = glyph.getCoordinates(self, _expandVARC=False)
             coords = coords.copy()
             controls = _GlyphControls(
                 numberOfContours=glyph.numberOfContours,
@@ -685,6 +694,104 @@ GID_IS_24_BIT = 0x2000  # component glyph ID is encoded as uint24 in GLYF
 CompositeMaxpValues = namedtuple(
     "CompositeMaxpValues", ["nPoints", "nContours", "maxComponentDepth"]
 )
+
+
+# Guards against pathological VARC -> glyf re-entrancy while expanding a
+# raw glyf glyph's coordinates. Keys are (id(glyfTable), glyphName).
+_varcCoordinatesInProgress = set()
+
+# id(glyfTable) -> [weakref.ref(TTFont), {id(glyph): glyphName} | None].
+# Kept outside the table objects on purpose: table__g_l_y_f instances are
+# unhashable and the font merger enumerates every instance attribute of each
+# table, so instance fields and a WeakKeyDictionary keyed by the table are
+# both unsuitable. A finalizer drops the entry when the glyf table is collected.
+_glyfVARCBridge = {}
+
+
+def _registerGlyfFont(glyfTable, ttFont):
+    key = id(glyfTable)
+    font_ref = weakref.ref(ttFont)
+    entry = _glyfVARCBridge.get(key)
+    if entry is None:
+        _glyfVARCBridge[key] = [font_ref, None]
+        try:
+            weakref.finalize(glyfTable, _glyfVARCBridge.pop, key, None)
+        except TypeError:  # pragma: no cover - table not weak-reference-able
+            pass
+    else:
+        entry[0] = font_ref
+
+
+def _varcGlyphName(glyfTable, glyph):
+    """Best-effort O(1) reverse lookup of a glyf Glyph object's name."""
+    glyphs = getattr(glyfTable, "glyphs", None)
+    if not glyphs:
+        return None
+
+    entry = _glyfVARCBridge.get(id(glyfTable))
+    name_by_id = entry[1] if entry is not None else None
+    if name_by_id is None:
+        name_by_id = {id(g): name for name, g in glyphs.items()}
+        if entry is not None:
+            entry[1] = name_by_id
+
+    name = name_by_id.get(id(glyph))
+    # Rebuild on a miss or if the cache is stale (glyphs were added or object
+    # ids were reused after a copy).
+    if name is None or glyphs.get(name) is not glyph:
+        name_by_id = {id(g): n for n, g in glyphs.items()}
+        if entry is not None:
+            entry[1] = name_by_id
+        name = name_by_id.get(id(glyph))
+    return name
+
+
+def _varcExpandedCoordinates(glyph, glyfTable, *, round=noRound, location=None):
+    """Expand a VARC-only shell into its component coordinates.
+
+    Returns a ``(coordinates, endPtsOfContours, flags)`` triple, or ``None``
+    when *glyph* should use the classical simple/composite path.
+
+    Raw glyf glyphs carry no variation location, so *location* (an axis
+    mapping) selects the instance and ``None`` means the font's default. For
+    repeated location-specific queries prefer
+    ``TTFont.getGlyphSet(location=...)``.
+    """
+    if glyfTable is None:
+        return None
+    entry = _glyfVARCBridge.get(id(glyfTable))
+    if entry is None or entry[0] is None:
+        return None
+    ttFont = entry[0]()
+    if ttFont is None:
+        return None
+    try:
+        varcCoverage = ttFont["VARC"].table.Coverage.glyphs
+    except (KeyError, AttributeError, TypeError):
+        return None
+
+    glyphName = _varcGlyphName(glyfTable, glyph)
+    if glyphName is None or glyphName not in varcCoverage:
+        return None
+
+    # Only take over a genuine empty shell. A VARC-covered glyph may still
+    # carry a real simple outline (>0 contours) or a traditional composite
+    # (-1); those must keep their established glyf coordinates and bounding
+    # boxes (and save/round-trip behavior) unchanged.
+    if getattr(glyph, "numberOfContours", None) != 0:
+        return None
+
+    key = (id(glyfTable), glyphName)
+    if key in _varcCoordinatesInProgress:
+        # Broken component cycle: behave like an empty shell on re-entry.
+        return GlyphCoordinates(), [], bytearray()
+
+    _varcCoordinatesInProgress.add(key)
+    try:
+        glyphSet = ttFont.getGlyphSet(location=location)
+        return glyphSet[glyphName].getCoordinates(glyfTable, round=round)
+    finally:
+        _varcCoordinatesInProgress.discard(key)
 
 
 class Glyph(object):
@@ -1211,20 +1318,26 @@ class Glyph(object):
             lastflag = flag
         return (compressedFlags, compressedXs, compressedYs)
 
-    def recalcBounds(self, glyfTable, *, boundsDone=None):
+    def recalcBounds(self, glyfTable, *, boundsDone=None, location=None):
         """Recalculates the bounds of the glyph.
 
         Each glyph object stores its bounding box in the
         ``xMin``/``yMin``/``xMax``/``yMax`` attributes. These bounds must be
         recomputed when the ``coordinates`` change. The ``table__g_l_y_f`` bounds
         must be provided to resolve component bounds.
+
+        For a VARC-only empty shell, *location* (an optional axis-location
+        mapping) selects the variation instance used to expand the components;
+        the default location is used when it is ``None``.
         """
         if self.isComposite() and self.tryRecalcBoundsComposite(
             glyfTable, boundsDone=boundsDone
         ):
             return
         try:
-            coords, endPts, flags = self.getCoordinates(glyfTable, round=otRound)
+            coords, endPts, flags = self.getCoordinates(
+                glyfTable, round=otRound, location=location
+            )
             self.xMin, self.yMin, self.xMax, self.yMax = coords.calcIntBounds()
         except NotImplementedError:
             pass
@@ -1282,7 +1395,9 @@ class Glyph(object):
         else:
             return self.numberOfContours == -1
 
-    def getCoordinates(self, glyfTable, *, round=noRound):
+    def getCoordinates(
+        self, glyfTable, *, round=noRound, location=None, _expandVARC=True
+    ):
         """Return the coordinates, end points and flags
 
         This method returns three values: A :py:class:`GlyphCoordinates` object,
@@ -1296,7 +1411,20 @@ class Glyph(object):
 
         To interpret the flags for each point, see the "Simple Glyph Flags"
         section of the `glyf table specification <https://docs.microsoft.com/en-us/typography/opentype/spec/glyf#simple-glyph-description>`.
+
+        If the glyph is a VARC-only empty shell and *glyfTable* belongs to a
+        font containing a ``VARC`` table, the variable components are expanded
+        at *location* (defaulting to the font's default location). Internal
+        callers that require the raw classical coordinates pass
+        ``_expandVARC=False``.
         """
+
+        if _expandVARC:
+            varcCoordinates = _varcExpandedCoordinates(
+                self, glyfTable, round=round, location=location
+            )
+            if varcCoordinates is not None:
+                return varcCoordinates
 
         if self.numberOfContours > 0:
             return self.coordinates, self.endPtsOfContours, self.flags
@@ -1309,7 +1437,7 @@ class Glyph(object):
                 g = glyfTable[compo.glyphName]
                 try:
                     coordinates, endPts, flags = g.getCoordinates(
-                        glyfTable, round=round
+                        glyfTable, round=round, _expandVARC=False
                     )
                 except RecursionError:
                     raise ttLib.TTLibError(
@@ -1522,7 +1650,7 @@ class Glyph(object):
             return
 
         self.expand(glyfTable)
-        coordinates, endPts, flags = self.getCoordinates(glyfTable)
+        coordinates, endPts, flags = self.getCoordinates(glyfTable, _expandVARC=False)
         extended = glyfTable is None or glyfTable.extended
         if offset:
             coordinates = coordinates.copy()
@@ -1621,7 +1749,7 @@ class Glyph(object):
                 pen.addComponent(glyphName, transform)
             return
 
-        coordinates, endPts, flags = self.getCoordinates(glyfTable)
+        coordinates, endPts, flags = self.getCoordinates(glyfTable, _expandVARC=False)
         extended = glyfTable is None or glyfTable.extended
         if offset:
             coordinates = coordinates.copy()
