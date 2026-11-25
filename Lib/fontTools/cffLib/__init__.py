@@ -1552,7 +1552,15 @@ def getStdCharSet(charset):
 
 
 def getCIDfromName(name, strings):
-    return int(name[3:])
+    # The .notdef glyph occupies CID 0.  A merged CID-keyed font can contain
+    # additional .notdef slots renamed to e.g. ".notdef.1" by the glyph-order
+    # logic; encode those as CID 0 as well, which the CFF spec permits.
+    if name == ".notdef" or name.startswith(".notdef."):
+        return 0
+    # A disambiguation suffix (e.g. "cid00005.1") may be appended when glyph
+    # names collide during a merge; the CID is the leading numeric part.
+    baseName = name.split(".", 1)[0]
+    return int(baseName[3:])
 
 
 def getSIDfromName(name, strings):

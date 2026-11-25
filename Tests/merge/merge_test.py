@@ -899,6 +899,431 @@ def test_merge_MATH():
     ] == ["minus"]
 
 
+def _build_cid_cff_font(
+    *, ros, glyphs, fd_specs, global_subr_programs, cmap, name="TestCID"
+):
+    """Build an in-memory CID-keyed CFF1 OTF with multiple FontDicts.
+
+    ``glyphs`` is a list of ``(glyphName, fdIndex, program)``.  Each entry in
+    ``fd_specs`` is a dict with a ``"private"`` mapping and an optional
+    ``"subrs"`` list of subr programs.
+    """
+    from fontTools.cffLib import (
+        CFFFontSet,
+        TopDictIndex,
+        TopDict,
+        CharStrings,
+        GlobalSubrsIndex,
+        SubrsIndex,
+        PrivateDict,
+        FDArrayIndex,
+        FontDict,
+        FDSelect,
+        IndexedStrings,
+    )
+    from fontTools.misc.psCharStrings import T2CharString
+
+    font = ttLib.TTFont(sfntVersion="OTTO")
+    glyphOrder = [g[0] for g in glyphs]
+    font.setGlyphOrder(glyphOrder)
+
+    fontSet = CFFFontSet()
+    fontSet.major = 1
+    fontSet.minor = 0
+    fontSet.otFont = font
+    fontSet.fontNames = [name]
+    fontSet.topDictIndex = TopDictIndex()
+    fontSet.strings = IndexedStrings()
+
+    globalSubrs = GlobalSubrsIndex()
+    fontSet.GlobalSubrs = globalSubrs
+    for prog in global_subr_programs:
+        globalSubrs.append(
+            T2CharString(program=list(prog), private=None, globalSubrs=globalSubrs)
+        )
+
+    fdArray = FDArrayIndex()
+    fdArray.strings = fontSet.strings
+    fdArray.GlobalSubrs = globalSubrs
+    privates = []
+    for spec in fd_specs:
+        fontDict = FontDict()
+        private = PrivateDict()
+        for key, value in spec["private"].items():
+            setattr(private, key, value)
+        fontDict.Private = private
+        if spec.get("subrs"):
+            subrs = SubrsIndex()
+            for prog in spec["subrs"]:
+                subrs.append(
+                    T2CharString(
+                        program=list(prog), private=private, globalSubrs=globalSubrs
+                    )
+                )
+            private.Subrs = subrs
+        fdArray.append(fontDict)
+        privates.append(private)
+
+    topDict = TopDict()
+    topDict.GlobalSubrs = globalSubrs
+    topDict.ROS = ros
+    topDict.CIDFontVersion = 1.0
+    topDict.CIDFontRevision = 0
+    topDict.CIDCount = len(glyphs)
+    topDict.FontMatrix = [0.001, 0, 0, 0.001, 0, 0]
+    topDict.FontBBox = [0, 0, 0, 0]
+    topDict.FDArray = fdArray
+
+    fdSelect = FDSelect()
+    fdSelect.format = None
+    for _, fdIndex, _ in glyphs:
+        fdSelect.append(fdIndex)
+    topDict.FDSelect = fdSelect
+    topDict.charset = glyphOrder
+
+    charStrings = CharStrings(None, None, globalSubrs, None, fdSelect, fdArray)
+    for glyphName, fdIndex, program in glyphs:
+        charString = T2CharString(
+            program=list(program), private=privates[fdIndex], globalSubrs=globalSubrs
+        )
+        charString.fdSelectIndex = fdIndex
+        charStrings[glyphName] = charString
+    topDict.CharStrings = charStrings
+    fontSet.topDictIndex.append(topDict)
+
+    cffTable = ttLib.newTable("CFF ")
+    cffTable.cff = fontSet
+    font["CFF "] = cffTable
+
+    cmapTable = ttLib.newTable("cmap")
+    cmapTable.tableVersion = 0
+    sub = ttLib.getTableModule("cmap").CmapSubtable.newSubtable(4)
+    sub.platformID, sub.platEncID, sub.language = 3, 1, 0
+    sub.cmap = dict(cmap)
+    cmapTable.tables = [sub]
+    cmapTable.numSubTables = 1
+    font["cmap"] = cmapTable
+
+    fb = FontBuilder(font=font)
+    fb.setupHorizontalMetrics({g[0]: (500, 0) for g in glyphs})
+    fb.setupHorizontalHeader()
+    fb.setupNameTable({"familyName": name, "styleName": "Regular"})
+    fb.setupOS2()
+    fb.setupPost()
+    fb.setupMaxp()
+    fb.setupHead(unitsPerEm=1000)
+    return font
+
+
+# Shared charstring fragments used by the CID merge fixtures.
+_CID_GSUBR_A = [10, 10, "rmoveto", 80, "hlineto", "return"]
+_CID_GSUBR_B = [80, "vlineto", -80, "hlineto", "return"]
+_CID_LSUBR = [5, 5, "rmoveto", "return"]
+
+
+def _cid_font_one():
+    # Two FontDicts with different default/nominal widths, two global subrs.
+    return _build_cid_cff_font(
+        ros=("Adobe", "Identity", 0),
+        glyphs=[
+            (".notdef", 0, ["endchar"]),
+            ("cid00001", 0, [300, -107, "callgsubr", -106, "callgsubr", "endchar"]),
+            ("cid00002", 1, [-107, "callsubr", -107, "callgsubr", "endchar"]),
+            ("cid00003", 1, [600, -107, "callgsubr", "endchar"]),
+        ],
+        fd_specs=[
+            {"private": {"defaultWidthX": 500, "nominalWidthX": 0}},
+            {
+                "private": {"defaultWidthX": 600, "nominalWidthX": 100},
+                "subrs": [_CID_LSUBR],
+            },
+        ],
+        global_subr_programs=[_CID_GSUBR_A, _CID_GSUBR_B],
+        cmap={0x41: "cid00001", 0x42: "cid00002", 0x43: "cid00003"},
+    )
+
+
+def _cid_font_two():
+    # Three FontDicts; one global subroutine and a local subroutine.
+    return _build_cid_cff_font(
+        ros=("Adobe", "Identity", 0),
+        glyphs=[
+            (".notdef", 2, ["endchar"]),
+            ("cid00004", 0, [-107, "callgsubr", "endchar"]),
+            ("cid00005", 1, [750, -107, "callgsubr", "endchar"]),
+            ("cid00006", 2, [-107, "callsubr", "endchar"]),
+        ],
+        fd_specs=[
+            {"private": {"defaultWidthX": 250, "nominalWidthX": 50}},
+            {"private": {"defaultWidthX": 700, "nominalWidthX": 0}},
+            {
+                "private": {"defaultWidthX": 400, "nominalWidthX": 0},
+                "subrs": [_CID_LSUBR],
+            },
+        ],
+        global_subr_programs=[_CID_GSUBR_B],
+        cmap={0x44: "cid00004", 0x45: "cid00005", 0x46: "cid00006"},
+    )
+
+
+def _record_outline(font, glyphName):
+    from fontTools.pens.recordingPen import RecordingPen
+
+    pen = RecordingPen()
+    font.getGlyphSet()[glyphName].draw(pen)
+    return pen.value
+
+
+def test_merge_cid_cff_roundtrip():
+    font1 = _cid_font_one()
+    font2 = _cid_font_two()
+    merged = Merger().merge([font1, font2])
+    rt = ttLib.TTFont(_compile(merged))
+
+    top = rt["CFF "].cff[0]
+    assert top.ROS == ("Adobe", "Identity", 0)
+    # 4 glyphs from each font; the duplicate .notdef keeps a slot.
+    assert len(rt.getGlyphOrder()) == 8
+    # Font 1's two FDs plus font 2's three appended FDs.
+    assert len(top.FDArray) == 5
+    # Global subroutines are concatenated: 2 + 1.
+    assert len(rt["CFF "].cff.GlobalSubrs) == 3
+    # FDSelect: font1 keeps FD 0/1, font2's FDs shift by two.
+    assert top.FDSelect.gidArray == [0, 0, 1, 1, 2 + 2, 2 + 0, 2 + 1, 2 + 2]
+
+    # Every glyph's charstring points at the Private dict of its selected FD.
+    for gid, name in enumerate(rt.getGlyphOrder()):
+        charString = top.CharStrings[name]
+        assert charString.private is top.FDArray[top.FDSelect[gid]].Private
+
+    # cmap covers both source fonts.
+    assert set(rt.getBestCmap()) == {0x41, 0x42, 0x43, 0x44, 0x45, 0x46}
+
+
+def test_merge_cid_cff_glyph_outlines_widths_and_fds():
+    from fontTools.misc.psCharStrings import calcSubrBias
+
+    sources = [_cid_font_one(), _cid_font_two()]
+    merged = Merger().merge(list(sources))
+    rt = ttLib.TTFont(_compile(merged))
+    order = rt.getGlyphOrder()
+    top = rt["CFF "].cff[0]
+
+    # Positionally compare each source glyph against the merged glyph.
+    position = 0
+    for src in sources:
+        for name in src.getGlyphOrder():
+            merged_name = order[position]
+            assert _record_outline(src, name) == _record_outline(rt, merged_name)
+            assert src["hmtx"][name][0] == rt["hmtx"][merged_name][0]
+            position += 1
+    assert position == len(order)
+
+    # Every subroutine call in the merged font must resolve.
+    globalSubrs = rt["CFF "].cff.GlobalSubrs
+    gbias = calcSubrBias(globalSubrs)
+    for name in order:
+        charString = top.CharStrings[name]
+        charString.decompile()
+        for i in range(1, len(charString.program)):
+            token = charString.program[i]
+            if token == "callgsubr":
+                index = charString.program[i - 1] + gbias
+                assert 0 <= index < len(globalSubrs)
+            elif token == "callsubr":
+                subrs = charString.private.Subrs
+                index = charString.program[i - 1] + calcSubrBias(subrs)
+                assert 0 <= index < len(subrs)
+
+
+def test_merge_cid_cff_remaps_global_subr_in_local_subr():
+    # A local subroutine that itself calls a global subroutine must have its
+    # callgsubr operand remapped when the global INDEX is concatenated.
+    lsubr_calls_gsubr = [-107, "callgsubr", 7, 7, "rmoveto", "return"]
+    font1 = _cid_font_one()  # two global subrs
+    font2 = _build_cid_cff_font(
+        ros=("Adobe", "Identity", 0),
+        glyphs=[
+            (".notdef", 0, ["endchar"]),
+            ("cid00004", 0, [-107, "callsubr", "endchar"]),
+        ],
+        fd_specs=[
+            {
+                "private": {"defaultWidthX": 400, "nominalWidthX": 0},
+                "subrs": [lsubr_calls_gsubr],
+            }
+        ],
+        global_subr_programs=[_CID_GSUBR_B],
+        cmap={0x44: "cid00004"},
+    )
+    src_outline = _record_outline(font2, "cid00004")
+
+    merged = Merger().merge([font1, font2])
+    # The round-tripped font renders identically (local subr -> global subr
+    # resolves through the glyph's globalSubrs binding).
+    rt = ttLib.TTFont(_compile(merged))
+    order = rt.getGlyphOrder()
+    assert _record_outline(rt, order[-1]) == src_outline
+
+    # On the in-memory merged object the bindings are still intact.  Font 1 has
+    # two FDs (indices 0 and 1); font 2's single FD is appended at index 2, and
+    # its gsubr 0 now sits at merged global index 2.
+    from fontTools.misc.psCharStrings import calcSubrBias
+
+    top = merged["CFF "].cff[0]
+    subr = top.FDArray[2].Private.Subrs[0]
+    gbias = calcSubrBias(merged["CFF "].cff.GlobalSubrs)
+    targets = [
+        subr.program[i - 1] + gbias
+        for i in range(1, len(subr.program))
+        if subr.program[i] == "callgsubr"
+    ]
+    assert targets == [2]
+
+
+def test_merge_cid_cff_three_fonts():
+    font1 = _cid_font_one()
+    font2 = _cid_font_two()
+    font3 = _build_cid_cff_font(
+        ros=("Adobe", "Identity", 0),
+        glyphs=[
+            (".notdef", 0, ["endchar"]),
+            ("cid00007", 0, [-107, "callgsubr", "endchar"]),
+            ("cid00008", 1, [333, -107, "callgsubr", "endchar"]),
+        ],
+        fd_specs=[
+            {"private": {"defaultWidthX": 500, "nominalWidthX": 0}},
+            {"private": {"defaultWidthX": 800, "nominalWidthX": 0}},
+        ],
+        global_subr_programs=[_CID_GSUBR_A],
+        cmap={0x47: "cid00007", 0x48: "cid00008"},
+    )
+    rt = ttLib.TTFont(_compile(Merger().merge([font1, font2, font3])))
+    order = rt.getGlyphOrder()
+    # 4 + 4 + 3 glyphs, with two extra .notdef slots.
+    assert len(order) == 11
+    # The two non-.notdef font3 glyphs survive with their outlines and widths.
+    for src_name in ("cid00007", "cid00008"):
+        merged_name = order[order.index(src_name)]
+        assert _record_outline(font3, src_name) == _record_outline(rt, merged_name)
+        assert font3["hmtx"][src_name][0] == rt["hmtx"][merged_name][0]
+
+
+def test_merge_cid_cff_crosses_global_subr_bias_threshold():
+    from fontTools.misc.psCharStrings import calcSubrBias
+
+    # The base font keeps bias 107 (two global subroutines); a base glyph and
+    # a base subroutine both call global subroutines using that bias.
+    font1 = _cid_font_one()
+    base_global = font1["CFF "].cff.GlobalSubrs
+    assert calcSubrBias(base_global) == 107
+    # Make base global subroutine 1 call global subroutine 0 (operand 0-107).
+    base_global[1].program = [0 - 107, "callgsubr", 9, "vlineto", "return"]
+    base_outlines = {
+        name: _record_outline(font1, name) for name in font1.getGlyphOrder()
+    }
+
+    # 1238 global subroutines still use bias 107 on their own, but the merged
+    # INDEX holds 1240 entries and therefore switches to bias 1131.
+    count = 1238
+    font2 = _build_cid_cff_font(
+        ros=("Adobe", "Identity", 0),
+        glyphs=[
+            (".notdef", 0, ["endchar"]),
+            ("cid00009", 0, [0 - 107, "callgsubr", "endchar"]),
+        ],
+        fd_specs=[{"private": {"defaultWidthX": 400, "nominalWidthX": 0}}],
+        global_subr_programs=[[i % 40, "hlineto", "return"] for i in range(count)],
+        cmap={0x49: "cid00009"},
+    )
+    assert calcSubrBias(font2["CFF "].cff.GlobalSubrs) == 107
+
+    merged = Merger().merge([font1, font2])
+    merged_global = merged["CFF "].cff.GlobalSubrs
+    assert len(merged_global) == 1240
+    assert calcSubrBias(merged_global) == 1131
+
+    # The round-tripped font renders every base glyph identically even though
+    # the base operands were rewritten from bias 107 to bias 1131.
+    rt = ttLib.TTFont(_compile(merged))
+    for name in font1.getGlyphOrder():
+        assert _record_outline(rt, name) == base_outlines[name]
+
+    # Base global subroutine 1 (still at merged index 1) now addresses index 0
+    # using the new bias: operand 0 - 1131.
+    subr = merged_global[1]
+    assert subr.program[0] == 0 - 1131
+
+
+def test_merge_cid_cff_rejects_different_ros():
+    font1 = _cid_font_one()
+    font2 = _cid_font_two()
+    font2["CFF "].cff[0].ROS = ("Adobe", "Japan1", 0)
+    with pytest.raises(ValueError, match="different ROS"):
+        Merger().merge([font1, font2])
+
+
+def test_merge_cid_cff_rejects_conflicting_cids():
+    font1 = _cid_font_one()
+    # A second font whose glyph uses CID 1, already present in font 1.
+    font2 = _build_cid_cff_font(
+        ros=("Adobe", "Identity", 0),
+        glyphs=[
+            (".notdef", 0, ["endchar"]),
+            ("cid00001", 0, [-107, "callgsubr", "endchar"]),
+        ],
+        fd_specs=[{"private": {"defaultWidthX": 400, "nominalWidthX": 0}}],
+        global_subr_programs=[_CID_GSUBR_B],
+        cmap={0x44: "cid00001"},
+    )
+    with pytest.raises(ValueError, match="conflicting CIDs"):
+        Merger().merge([font1, font2])
+
+
+def test_merge_cid_cff_rejects_broken_global_subr():
+    font1 = _cid_font_one()
+    font2 = _cid_font_two()
+    charString = font2["CFF "].cff[0].CharStrings["cid00004"]
+    charString.decompile()
+    charString.program = [-108, "callgsubr", "endchar"]
+    charString.bytecode = None
+    with pytest.raises(ValueError, match="unresolvable subroutine reference"):
+        Merger().merge([font1, font2])
+
+
+def test_merge_cid_cff_rejects_broken_local_subr():
+    font1 = _cid_font_one()
+    font2 = _cid_font_two()
+    charString = font2["CFF "].cff[0].CharStrings["cid00006"]
+    charString.decompile()
+    charString.program = [-108, "callsubr", "endchar"]
+    charString.bytecode = None
+    with pytest.raises(ValueError, match="unresolvable subroutine reference"):
+        Merger().merge([font1, font2])
+
+
+def test_merge_cid_cff_rejects_mixed_name_keyed():
+    cid_font = _cid_font_one()
+    name_keyed = ttLib.TTFont(recalcBBoxes=False, recalcTimestamp=False)
+    name_keyed.importXML(
+        os.path.join(os.path.dirname(__file__), "data", "CFFFont1.ttx")
+    )
+    with pytest.raises(ValueError, match="name-keyed CFF font with a CID-keyed"):
+        Merger().merge([cid_font, name_keyed])
+
+
+def test_cid_glyph_name_decoding():
+    from fontTools.merge.tables import _getCID
+
+    assert _getCID(".notdef") == 0
+    assert _getCID(".notdef.1") == 0
+    assert _getCID("cid00000") == 0
+    assert _getCID("cid00001") == 1
+    assert _getCID("cid01234.2") == 1234
+    with pytest.raises(ValueError, match="not a valid CID glyph name"):
+        _getCID("bogusname")
+
+
 if __name__ == "__main__":
     import sys
 

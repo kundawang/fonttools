@@ -3,7 +3,7 @@
 # Google Author(s): Behdad Esfahbod, Roozbeh Pournader
 
 from fontTools import ttLib, cffLib
-from fontTools.misc.psCharStrings import T2WidthExtractor
+from fontTools.misc.psCharStrings import T2WidthExtractor, calcSubrBias
 from fontTools.ttLib.tables.DefaultTable import DefaultTable
 from fontTools.merge.base import add_method, mergeObjects
 from fontTools.merge.cmap import computeMegaCmap
@@ -254,11 +254,103 @@ ttLib.getTableClass("gasp").mergeMap = lambda self, lst: first(
 )  # FIXME? Appears irreconcilable
 
 
+def _isCIDFont(topDict):
+    return hasattr(topDict, "FDSelect")
+
+
+def _getCID(glyphName):
+    """Return the CID encoded in a CID-keyed charset entry name.
+
+    Handles ``cidNNNNN`` names, disambiguation suffixes (``cid00001.1``), and
+    the ``.notdef`` slot (CID 0, including a renamed ``.notdef.1``).
+    """
+    if glyphName == ".notdef" or glyphName.startswith(".notdef."):
+        return 0
+    baseName = glyphName.split(".", 1)[0]
+    if not baseName.startswith("cid") or not baseName[3:].isdigit():
+        raise ValueError(
+            "CID-keyed CFF charset entry %r is not a valid CID glyph name" % glyphName
+        )
+    return cffLib.getCIDfromName(baseName, None)
+
+
+def _validateSubrReferences(charString, localSubrs, globalSubrs, where):
+    """Make sure every callsubr/callgsubr operand in ``charString`` resolves.
+
+    Raises ``ValueError`` instead of letting an ``IndexError``/``AssertionError``
+    escape deep in the charstring machinery, so a broken font never produces a
+    merged font that saves fine but draws the wrong outlines.
+    """
+    try:
+        charString.decompile()
+    except (IndexError, AssertionError) as e:
+        raise ValueError(
+            "Charstring %s has an unresolvable subroutine reference: %s" % (where, e)
+        ) from e
+    program = charString.program
+    localBias = calcSubrBias(localSubrs)
+    globalBias = calcSubrBias(globalSubrs)
+    for index in range(1, len(program)):
+        token = program[index]
+        if token == "callsubr":
+            subrIndex = program[index - 1]
+            if not isinstance(subrIndex, int) or not (
+                -localBias <= subrIndex < len(localSubrs) - localBias
+            ):
+                raise ValueError(
+                    "Charstring %s references missing local subroutine %d"
+                    % (where, subrIndex)
+                )
+        elif token == "callgsubr":
+            subrIndex = program[index - 1]
+            if not isinstance(subrIndex, int) or not (
+                -globalBias <= subrIndex < len(globalSubrs) - globalBias
+            ):
+                raise ValueError(
+                    "Charstring %s references missing global subroutine %d"
+                    % (where, subrIndex)
+                )
+
+
+def _remapGSubrReferences(charString, oldBias, offset, newBias):
+    """Rewrite callgsubr operands after global subroutines are concatenated.
+
+    ``offset`` is the index at which the font's own global subroutines were
+    appended to the merged global subroutine INDEX.
+    """
+    charString.decompile()
+    program = charString.program
+    for index in range(1, len(program)):
+        if program[index] == "callgsubr":
+            assert isinstance(program[index - 1], int)
+            program[index - 1] = (program[index - 1] + oldBias + offset) - newBias
+
+
+def _iterCIDCharStrings(font, globalSubrs):
+    """Yield every T2CharString in a CID-keyed font that can hold subroutine
+    calls: the glyph charstrings, the local subroutines of every FontDict, and
+    the global subroutines.
+    """
+    for glyphName in font.charset:
+        charString, _ = font.CharStrings.getItemAndSelector(glyphName)
+        yield charString
+    for fd in font.FDArray:
+        localSubrs = getattr(fd.Private, "Subrs", None)
+        if localSubrs:
+            for subr in localSubrs:
+                yield subr
+    for subr in globalSubrs:
+        yield subr
+
+
 @add_method(ttLib.getTableClass("CFF "))
 def merge(self, m, tables):
-    if any(hasattr(table.cff[0], "FDSelect") for table in tables):
-        raise NotImplementedError("Merging CID-keyed CFF tables is not supported yet")
+    if any(_isCIDFont(table.cff[0]) for table in tables):
+        return _mergeCIDCFF(tables)
+    return _mergeNameKeyedCFF(tables)
 
+
+def _mergeNameKeyedCFF(tables):
     for table in tables:
         table.cff.desubroutinize()
 
@@ -324,6 +416,161 @@ def merge(self, m, tables):
     newfont.strings.strings = glyphOrderStrings + storedNamesStrings
 
     return newcff
+
+
+def _mergeCIDCFF(tables):
+    """Merge two or more compatible CID-keyed CFF1 fonts.
+
+    The fonts must share the same ROS and use disjoint sets of CIDs.  Each
+    font keeps its own FontDicts (and hence its Private dictionaries and
+    local subroutines); the glyphs of every font after the first are
+    reassigned to those FontDicts, which are appended to the first font's
+    FDArray.  Global subroutines are concatenated and their references are
+    remapped.  Incompatible inputs raise rather than producing a font that
+    saves but renders incorrectly.
+    """
+    baseCFF = tables[0]
+    baseFont = baseCFF.cff[0]
+    baseROS = baseFont.ROS
+
+    # All fonts must be CID-keyed and share the ROS.
+    for table in tables[1:]:
+        font = table.cff[0]
+        if not _isCIDFont(font):
+            raise ValueError(
+                "Cannot merge a name-keyed CFF font with a CID-keyed CFF font"
+            )
+        if font.ROS != baseROS:
+            raise ValueError(
+                "Cannot merge CID-keyed CFF fonts with different ROS values: "
+                "%r != %r" % (baseROS, font.ROS)
+            )
+
+    # CIDs must not collide. CID 0 is the .notdef CID and is shared.
+    seenCIDs = set()
+    for table in tables:
+        font = table.cff[0]
+        cids = {_getCID(name) for name in font.charset if _getCID(name) != 0}
+        overlap = seenCIDs & cids
+        if overlap:
+            raise ValueError(
+                "Cannot merge CID-keyed CFF fonts: conflicting CIDs: %s"
+                % ", ".join("cid%05d" % cid for cid in sorted(overlap))
+            )
+        seenCIDs |= cids
+
+    newCharStrings = baseFont.CharStrings
+    newFDSelect = baseFont.FDSelect
+    newFDArray = baseFont.FDArray
+    newGlobalSubrs = baseCFF.cff.GlobalSubrs
+
+    # Validate every font's subroutine references before moving anything.
+    for table in tables:
+        _validateCIDSubrReferences(table.cff[0], table.cff.GlobalSubrs)
+
+    # Compute the size (and hence bias) of the fully concatenated global
+    # subroutine INDEX up front.  Writing every remapped operand against this
+    # final bias means a threshold crossing mid-merge never needs a second,
+    # error-prone correction pass (which would also touch the base font's
+    # charstrings that were never remapped).
+    totalGlobalSubrs = len(newGlobalSubrs) + sum(
+        len(table.cff.GlobalSubrs) for table in tables[1:]
+    )
+    finalGlobalBias = _biasForLength(totalGlobalSubrs)
+
+    # The base font's own charstrings keep global-subroutine INDEX position 0,
+    # but if concatenation changes the bias their callgsubr operands must be
+    # rewritten against the final bias as well.
+    baseGlobalBias = calcSubrBias(newGlobalSubrs)
+    if baseGlobalBias != finalGlobalBias:
+        for charString in _iterCIDCharStrings(baseFont, newGlobalSubrs):
+            _remapGSubrReferences(charString, baseGlobalBias, 0, finalGlobalBias)
+
+    newCharset = list(baseFont.charset)
+
+    for table in tables[1:]:
+        font = table.cff[0]
+        globalSubrs = table.cff.GlobalSubrs
+
+        oldGlobalBias = calcSubrBias(globalSubrs)
+        globalSubrOffset = len(newGlobalSubrs)
+
+        # Append the font's FontDicts.  Local subroutines stay attached to
+        # each FontDict's Private dict, so callsubr operands stay valid.
+        fdOffset = len(newFDArray)
+        for fd in font.FDArray:
+            newFDArray.append(fd)
+
+        # Reparent and remap callgsubr operands on every charstring in the
+        # font: glyphs, local subroutines (which may call global subroutines),
+        # and the global subroutines themselves.
+        for charString in _iterCIDCharStrings(font, globalSubrs):
+            if globalSubrs:
+                _remapGSubrReferences(
+                    charString, oldGlobalBias, globalSubrOffset, finalGlobalBias
+                )
+            charString.globalSubrs = newGlobalSubrs
+        for subr in globalSubrs:
+            newGlobalSubrs.append(subr)
+
+        for glyphIndex, glyphName in enumerate(font.charset):
+            charString, fdIndex = font.CharStrings.getItemAndSelector(glyphName)
+
+            # Reparent the glyph to the appended copy of its FontDict.
+            charString.private = font.FDArray[fdIndex].Private
+
+            newFDSelect.append(fdIndex + fdOffset)
+            # The charset and CharStrings keys keep the OpenType glyph names
+            # (including a renamed duplicate .notdef).  The CID charset
+            # packer maps any .notdef* name to CID 0.
+            newCharset.append(glyphName)
+
+            if newCharStrings.charStringsAreIndexed:
+                newIndex = len(newCharStrings.charStringsIndex)
+                newCharStrings.charStrings[glyphName] = newIndex
+                newCharStrings.charStringsIndex.items.append(charString)
+            else:
+                newCharStrings.charStrings[glyphName] = charString
+
+    baseFont.charset = newCharset
+    baseFont.numGlyphs = len(newCharset)
+    # Force the smallest valid FDSelect representation to be chosen at compile.
+    newFDSelect.format = None
+
+    return baseCFF
+
+
+def _biasForLength(length):
+    """calcSubrBias() for an INDEX that does not exist yet."""
+    if length < 1240:
+        return 107
+    elif length < 33900:
+        return 1131
+    return 32768
+
+
+def _validateCIDSubrReferences(font, globalSubrs):
+    """Check every glyph charstring and every local/global subroutine in a
+    CID-keyed font for resolvable subroutine references."""
+    for glyphName in font.charset:
+        charString, fdIndex = font.CharStrings.getItemAndSelector(glyphName)
+        localSubrs = getattr(font.FDArray[fdIndex].Private, "Subrs", [])
+        _validateSubrReferences(
+            charString, localSubrs, globalSubrs, "glyph %r" % glyphName
+        )
+    for fdIndex, fd in enumerate(font.FDArray):
+        localSubrs = getattr(fd.Private, "Subrs", None)
+        if not localSubrs:
+            continue
+        for index, subr in enumerate(localSubrs):
+            _validateSubrReferences(
+                subr,
+                localSubrs,
+                globalSubrs,
+                "FD %d local subroutine %d" % (fdIndex, index),
+            )
+    for index, subr in enumerate(globalSubrs):
+        _validateSubrReferences(subr, [], globalSubrs, "global subroutine %d" % index)
 
 
 @add_method(ttLib.getTableClass("cmap"))

@@ -1,3 +1,14 @@
+Drops from next release
+-----------------------
+
+- [merge] Support merging two or more compatible CID-keyed CFF1 fonts.  Fonts
+  must share the same ROS and use disjoint CIDs; their CharStrings,
+  FDArray/FDSelect, Private dictionaries, widths and local/global subroutine
+  references are combined.  Mismatched ROS, conflicting CIDs, or unresolvable
+  subroutine references now raise instead of producing a font that saves but
+  renders incorrectly.  Name-keyed CFF merging is unchanged.
+
+
 4.68.0 (released 2026-10-27)
 ----------------------------
 
