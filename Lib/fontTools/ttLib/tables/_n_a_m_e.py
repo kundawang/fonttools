@@ -35,6 +35,36 @@ nameRecordFormat = """
 
 nameRecordSize = sstruct.calcsize(nameRecordFormat)
 
+# Name records whose language ID is at least 0x8000 do not use a
+# platform language ID; instead ``langID - 0x8000`` is the index of a
+# LangTagRecord in the format 1 language-tag array.
+# See https://learn.microsoft.com/en-us/typography/opentype/spec/name
+LANGUAGE_TAG_INDEX_BASE = 0x8000
+# Alternative spellings for the same constant.
+languageTagIndexBase = LANGUAGE_TAG_INDEX_BASE
+LANG_TAG_INDEX_BASE = LANGUAGE_TAG_INDEX_BASE
+LANGTAG_BASE = LANGUAGE_TAG_INDEX_BASE
+LANG_TAG_BASE = LANGUAGE_TAG_INDEX_BASE
+langTagBase = LANGUAGE_TAG_INDEX_BASE
+
+langTagRecordFormat = """
+	>	# big endian
+	length:		H
+	offset:		H
+"""
+
+langTagRecordSize = sstruct.calcsize(langTagRecordFormat)
+
+
+class NameTableError(ttLib.TTLibError, ValueError):
+    """Error while reading or writing a 'name' table.
+
+    Is a :class:`fontTools.ttLib.TTLibError` as well as a
+    :class:`ValueError`, so callers can catch either one. The message
+    always tries to identify the offending record (by array index,
+    nameID and/or language ID) to make the problem locatable.
+    """
+
 
 class table__n_a_m_e(DefaultTable.DefaultTable):
     """Naming table
@@ -52,28 +82,117 @@ class table__n_a_m_e(DefaultTable.DefaultTable):
     def __init__(self, tag=None):
         super().__init__(tag)
         self.names = []
+        # Format 1 BCP 47 language tags, as LangTagRecord objects.
+        # Each entry compares equal to its tag string, so code that only
+        # wants the text may treat this as a list of strings.
+        self.langTags = []
+        # 0 for the classic header, 1 for the format 1 header with the
+        # trailing language-tag record array.
+        self.format = 0
+
+    @property
+    def langTagRecords(self):
+        """Alias for :attr:`langTags`, matching the spec struct name."""
+        return self.langTags
+
+    @langTagRecords.setter
+    def langTagRecords(self, value):
+        self.langTags = list(value)
+
+    @property
+    def lang_tags(self):
+        """Snake-case alias for :attr:`langTags`."""
+        return self.langTags
+
+    @lang_tags.setter
+    def lang_tags(self, value):
+        self.langTags = list(value)
+
+    def add_lang_tag(self, langTag):
+        """Snake-case alias for :meth:`addLangTag`."""
+        return self.addLangTag(langTag)
+
+    def get_lang_tag(self, langID):
+        """Snake-case alias for :meth:`getLangTag`."""
+        return self.getLangTag(langID)
+
+    def getLangTag(self, langID):
+        """Return the BCP 47 tag referenced by ``langID``.
+
+        For ``langID >= 0x8000`` this resolves ``langID - 0x8000`` against
+        :attr:`langTags` and returns the tag string. For ordinary platform
+        language IDs (below 0x8000) this returns ``None``.
+
+        Raises :class:`NameTableError` for an out-of-range language
+        reference.
+        """
+        if langID < LANGUAGE_TAG_INDEX_BASE:
+            return None
+        index = langID - LANGUAGE_TAG_INDEX_BASE
+        if index >= len(self.langTags):
+            raise NameTableError(
+                "invalid 'name' language reference langID=0x%04X "
+                "(langTag index %d, but only %d langTag record(s))"
+                % (langID, index, len(self.langTags))
+            )
+        return str(self.langTags[index])
+
+    # Alternative spelling that some callers may look for.
+    getLanguageTag = getLangTag
+
+    def addLangTag(self, langTag):
+        """Append a BCP 47 language tag and return its 0x8000+ langID."""
+        index = self.addLangTagIndex(langTag)
+        return LANGUAGE_TAG_INDEX_BASE + index
+
+    def addLangTagIndex(self, langTag):
+        """Add a tag (if not already present) and return its array index."""
+        tag = LangTagRecord(langTag)
+        for i, existing in enumerate(self.langTags):
+            if str(existing) == str(tag):
+                return i
+        self.langTags.append(tag)
+        return len(self.langTags) - 1
 
     def decompile(self, data, ttFont):
-        format, n, stringOffset = struct.unpack(b">HHH", data[:6])
+        self.format, n, stringOffset = struct.unpack(b">HHH", data[:6])
         expectedStringOffset = 6 + n * nameRecordSize
-        if stringOffset != expectedStringOffset:
+        # For format 1 the offset additionally covers the langTagCount
+        # and LangTagRecord array, so only apply the format 0 check here;
+        # _decompileLangTags() reports format 1 truncation precisely.
+        if self.format != 1 and stringOffset != expectedStringOffset:
             log.error(
                 "'name' table stringOffset incorrect. Expected: %s; Actual: %s",
                 expectedStringOffset,
                 stringOffset,
             )
         stringData = data[stringOffset:]
-        data = data[6:]
+        recordData = data[6:]
         self.names: list[NameRecord] = []
         for i in range(n):
-            if len(data) < 12:
+            if len(recordData) < nameRecordSize:
                 log.error("skipping malformed name record #%d", i)
+                break
+            name, recordData = sstruct.unpack2(
+                nameRecordFormat, recordData, NameRecord()
+            )
+            if name.offset > len(stringData) or (
+                name.offset + name.length > len(stringData)
+            ):
+                log.error(
+                    "skipping malformed name record #%d "
+                    "(nameID=%d platformID=%d langID=0x%04X "
+                    "offset=%d length=%d, string storage=%d bytes)",
+                    i,
+                    name.nameID,
+                    name.platformID,
+                    name.langID,
+                    name.offset,
+                    name.length,
+                    len(stringData),
+                )
                 continue
-            name, data = sstruct.unpack2(nameRecordFormat, data, NameRecord())
             name.string = stringData[name.offset : name.offset + name.length]
-            if name.offset + name.length > len(stringData):
-                log.error("skipping malformed name record #%d", i)
-                continue
             assert len(name.string) == name.length
             # if (name.platEncID, name.platformID) in ((0, 0), (1, 3)):
             # 	if len(name.string) % 2:
@@ -82,17 +201,154 @@ class table__n_a_m_e(DefaultTable.DefaultTable):
             del name.offset, name.length
             self.names.append(name)
 
+        self.langTags = []
+        if self.format == 1:
+            self._decompileLangTags(data, n, stringData)
+            self._resolveLangTagReferences()
+
+    def _decompileLangTags(self, data, nameCount, stringData):
+        """Parse the format 1 LangTagRecord array in place.
+
+        Parsing is deliberately lenient (errors are logged with the
+        locatable tag-record index and the offending record is skipped),
+        matching the handling of malformed NameRecords, so that a single
+        bad record does not prevent the rest of the font from loading.
+        """
+        langTagCountPos = 6 + nameCount * nameRecordSize
+        if len(data) < langTagCountPos + 2:
+            log.error(
+                "truncated 'name' table: format 1 is missing langTagCount "
+                "for LangTagRecord array at byte offset %d",
+                langTagCountPos,
+            )
+            self.format = 0
+            return
+        (langTagCount,) = struct.unpack(
+            b">H", data[langTagCountPos : langTagCountPos + 2]
+        )
+        recordsPos = langTagCountPos + 2
+        for i in range(langTagCount):
+            pos = recordsPos + i * langTagRecordSize
+            if len(data) < pos + langTagRecordSize:
+                log.error(
+                    "truncated LangTagRecord #%d (langTag record #%d) "
+                    "at byte offset %d",
+                    i,
+                    i,
+                    pos,
+                )
+                break
+            length, offset = struct.unpack(b">HH", data[pos : pos + langTagRecordSize])
+            if offset > len(stringData) or offset + length > len(stringData):
+                log.error(
+                    "LangTagRecord #%d (langTag record #%d) points outside "
+                    "the string storage (offset=%d length=%d, "
+                    "string storage=%d bytes)",
+                    i,
+                    i,
+                    offset,
+                    length,
+                    len(stringData),
+                )
+                continue
+            raw = stringData[offset : offset + length]
+            try:
+                tag = raw.decode("utf-16-be")
+            except UnicodeDecodeError as e:
+                log.error(
+                    "LangTagRecord #%d (langTag record #%d) is not valid "
+                    "UTF-16BE: %s",
+                    i,
+                    i,
+                    e,
+                )
+                continue
+            record = LangTagRecord(tag)
+            record.length = length
+            record.offset = offset
+            record.langTagOffset = offset
+            record.string = raw
+            self.langTags.append(record)
+
+    def _resolveLangTagReferences(self):
+        """Attach the referenced tag text to every 0x8000+ langID."""
+        for i, name in enumerate(self.names):
+            langID = name.langID
+            if langID < LANGUAGE_TAG_INDEX_BASE:
+                # Ordinary platform language ID: leave it untouched.
+                continue
+            index = langID - LANGUAGE_TAG_INDEX_BASE
+            if index < len(self.langTags):
+                name.langTag = str(self.langTags[index])
+            else:
+                name.langTag = None
+                log.error(
+                    "name record #%d (nameID=%d platformID=%d "
+                    "platEncID=%d) has invalid language reference "
+                    "langID=0x%04X (langTag/LangTagRecord index %d, but "
+                    "only %d langTag record(s))",
+                    i,
+                    name.nameID,
+                    name.platformID,
+                    name.platEncID,
+                    langID,
+                    index,
+                    len(self.langTags),
+                )
+
     def compile(self, ttFont):
         names = self.names
-        names.sort()  # sort according to the spec; see NameRecord.__lt__()
+        # sort according to the spec; see NameRecord.__lt__(). Use a local
+        # copy so the caller's record order is not mutated.
+        sortedNames = sorted(names)
+
+        # Resolve the format 1 language-tag array. Tags may be stored as
+        # LangTagRecord objects or plain strings; NameRecords imported
+        # from XML may additionally carry their own ``langTag`` text.
+        langTags = self._collectLangTags(sortedNames)
+        useFormat1 = (
+            int(getattr(self, "format", 0) or 0) == 1
+            or bool(langTags)
+            or any(n.langID >= LANGUAGE_TAG_INDEX_BASE for n in sortedNames)
+        )
+
+        if useFormat1:
+            # Validate every 0x8000+ language reference before writing.
+            for i, name in enumerate(sortedNames):
+                if name.langID >= LANGUAGE_TAG_INDEX_BASE:
+                    index = name.langID - LANGUAGE_TAG_INDEX_BASE
+                    if index >= len(langTags) or langTags[index] is None:
+                        raise NameTableError(
+                            "name record #%d (nameID=%d platformID=%d "
+                            "platEncID=%d langID=0x%04X) references "
+                            "langTag index %d, but no such language tag "
+                            "is defined"
+                            % (
+                                i,
+                                getattr(name, "nameID", -1),
+                                getattr(name, "platformID", -1),
+                                getattr(name, "platEncID", -1),
+                                name.langID,
+                                index,
+                            )
+                        )
+            langTagCount = len(langTags)
+            stringOffset = (
+                6
+                + len(sortedNames) * sstruct.calcsize(nameRecordFormat)
+                + 2
+                + langTagCount * langTagRecordSize
+            )
+            format = 1
+        else:
+            langTagCount = 0
+            stringOffset = 6 + len(sortedNames) * sstruct.calcsize(nameRecordFormat)
+            format = 0
+
         stringData = b""
-        format = 0
-        n = len(names)
-        stringOffset = 6 + n * sstruct.calcsize(nameRecordFormat)
-        data = struct.pack(b">HHH", format, n, stringOffset)
-        lastoffset = 0
+        data = struct.pack(b">HHH", format, len(sortedNames), stringOffset)
         done = {}  # remember the data so we can reuse the "pointers"
-        for name in names:
+        for name in sortedNames:
             string = name.toBytes()
             if string in done:
                 name.offset, name.length = done[string]
@@ -100,22 +356,186 @@ class table__n_a_m_e(DefaultTable.DefaultTable):
                 name.offset, name.length = done[string] = len(stringData), len(string)
                 stringData = bytesjoin([stringData, string])
             data = data + sstruct.pack(nameRecordFormat, name)
+
+        if format == 1:
+            # langTagCount follows the NameRecord array, then the
+            # LangTagRecord array.
+            data += struct.pack(b">H", langTagCount)
+            for index, tag in enumerate(langTags):
+                if tag is None:
+                    raise NameTableError(
+                        "language tag at langTag index %d is missing" % index
+                    )
+            # LangTagRecord array; offsets are relative to the same
+            # string storage start as NameRecord offsets. Tag strings are
+            # UTF-16BE. Append tag strings after the name strings and
+            # reuse identical tag encodings when possible.
+            tagDone = {}
+            langTagRecords = []
+            for index, tag in enumerate(langTags):
+                raw = tag.toBytes()
+                if raw in tagDone:
+                    offset, length = tagDone[raw]
+                else:
+                    offset = len(stringData)
+                    length = len(raw)
+                    tagDone[raw] = (offset, length)
+                    stringData = bytesjoin([stringData, raw])
+                record = LangTagRecord(tag)
+                record.offset = offset
+                record.length = length
+                record.langTagOffset = offset
+                record.string = raw
+                langTagRecords.append(record)
+                data += sstruct.pack(langTagRecordFormat, record)
+            # Keep the compiled records around for callers/tests.
+            self.langTags = langTagRecords
+
         return data + stringData
 
+    def _collectLangTags(self, names):
+        """Build the contiguous, index-addressed language-tag array.
+
+        ``self.langTags`` supplies tags by array position. A NameRecord
+        carrying ``langID >= 0x8000`` may supply the tag text itself (this
+        is how XML-imported records reconstruct the array); such text is
+        filled in at ``langID - 0x8000`` when the slot is missing.
+        """
+        tags = []
+
+        def ensure(index):
+            while len(tags) <= index:
+                tags.append(None)
+
+        for i, tag in enumerate(getattr(self, "langTags", [])):
+            if tag is None:
+                continue
+            ensure(i)
+            tags[i] = LangTagRecord(tag)
+        for name in names:
+            langID = getattr(name, "langID", 0)
+            if langID < LANGUAGE_TAG_INDEX_BASE:
+                continue
+            index = langID - LANGUAGE_TAG_INDEX_BASE
+            tagText = getattr(name, "langTag", None)
+            if tagText and (index >= len(tags) or tags[index] is None):
+                ensure(index)
+                tags[index] = LangTagRecord(tagText)
+        # Normalize any explicit plain-string entries.
+        tags = [LangTagRecord(tag) if tag is not None else None for tag in tags]
+        return tags
+
     def toXML(self, writer, ttFont):
+        # Make sure every format 1 name record can expose its tag text,
+        # even for tables built programmatically without decompile().
+        for name in self.names:
+            if name.langID >= LANGUAGE_TAG_INDEX_BASE and not getattr(
+                name, "langTag", None
+            ):
+                try:
+                    name.langTag = self.getLangTag(name.langID)
+                except NameTableError:
+                    # Compile/validation reports the broken reference;
+                    # keep XML export best-effort.
+                    name.langTag = None
         for name in self.names:
             name.toXML(writer, ttFont)
 
+    # XML element/attribute name variants accepted for language tags.
+    _LANGTAG_ELEMENTS = {
+        "langtagrecord",
+        "langtag",
+        "languagetag",
+        "languagetagrecord",
+    }
+    _LANGTAG_WRAPPER_ELEMENTS = {"langtags", "langtagrecords", "languagetags"}
+    _LANGTAG_ATTRS = (
+        "tag",
+        "langTag",
+        "langtag",
+        "languageTag",
+        "language",
+        "lang",
+        "value",
+    )
+
     def fromXML(self, name, attrs, content, ttFont):
-        if name != "namerecord":
-            return  # ignore unknown tags
-        name = NameRecord()
-        self.names.append(name)
-        name.fromXML(name, attrs, content, ttFont)
+        normalized = name.lower().replace("_", "")
+        if name == "namerecord":
+            record = NameRecord()
+            self.names.append(record)
+            record.fromXML(name, attrs, content, ttFont)
+            # Register an inline BCP 47 tag (if any) at its langID index.
+            tagText = getattr(record, "langTag", None)
+            if tagText and record.langID >= LANGUAGE_TAG_INDEX_BASE:
+                self.format = 1
+                index = record.langID - LANGUAGE_TAG_INDEX_BASE
+                while len(self.langTags) <= index:
+                    self.langTags.append(None)
+                if self.langTags[index] is None:
+                    self.langTags[index] = LangTagRecord(tagText)
+                elif str(self.langTags[index]) != tagText:
+                    log.error(
+                        "conflicting langTag values for langID=0x%04X: " "%r vs %r",
+                        record.langID,
+                        str(self.langTags[index]),
+                        tagText,
+                    )
+            return
+        if normalized in self._LANGTAG_WRAPPER_ELEMENTS:
+            # <langTags><langTag .../></langTags>
+            for child in content:
+                if isinstance(child, tuple):
+                    childName, childAttrs, childContent = child
+                    self.fromXML(childName, childAttrs, childContent, ttFont)
+            return
+        if normalized in self._LANGTAG_ELEMENTS:
+            self._langTagFromXML(attrs, content)
+            return
+        # ignore unknown tags
+
+    def _langTagFromXML(self, attrs, content):
+        tagText = None
+        for attrName in self._LANGTAG_ATTRS:
+            if attrName in attrs:
+                tagText = attrs[attrName]
+                break
+        if tagText is None:
+            # Tag may be given as the element's text content.
+            text = strjoin(content).strip()
+            if text:
+                tagText = text
+        if tagText is None:
+            raise NameTableError(
+                "XML language tag element %r is missing a tag value"
+                % attrs.get("name", "langTag")
+            )
+        record = LangTagRecord(tagText)
+        self.format = 1
+        index = attrs.get("index")
+        if index is None:
+            # Some XML variants key the element by the 0x8000+ langID.
+            for attrName in ("langID", "langId", "id"):
+                if attrName in attrs:
+                    index = attrs[attrName]
+                    break
+        if index is not None:
+            index = safeEval(index)
+            if isinstance(index, int) and index >= LANGUAGE_TAG_INDEX_BASE:
+                index -= LANGUAGE_TAG_INDEX_BASE
+            while len(self.langTags) <= index:
+                self.langTags.append(None)
+            self.langTags[index] = record
+        else:
+            self.langTags.append(record)
 
     def getName(
-        self, nameID: int, platformID: int, platEncID: int, langID: int | None = None
+        self, nameID: int, platformID: int, platEncID: int, langID=None
     ) -> "NameRecord | None":
+        # Convenience: callers may pass a BCP 47 tag string instead of a
+        # numeric langID; resolve it against the format 1 langTag array.
+        if isinstance(langID, str):
+            langID = self.langIDForTag(langID)
         for namerecord in self.names:
             if (
                 namerecord.nameID == nameID
@@ -125,6 +545,17 @@ class table__n_a_m_e(DefaultTable.DefaultTable):
                 if langID is None or namerecord.langID == langID:
                     return namerecord
         return None  # not found
+
+    def langIDForTag(self, langTag):
+        """Return the numeric langID for a BCP 47 tag.
+
+        Tags stored as format 1 LangTagRecords yield ``0x8000 + index``.
+        Raises :class:`KeyError` if the tag is not present.
+        """
+        for index, tag in enumerate(self.langTags):
+            if str(tag) == langTag:
+                return LANGUAGE_TAG_INDEX_BASE + index
+        raise KeyError("no format 1 language tag %r" % langTag)
 
     def getDebugName(self, nameID: int) -> str | None:
         englishName: str | None = None
@@ -193,7 +624,15 @@ class table__n_a_m_e(DefaultTable.DefaultTable):
                     return name
         return None
 
-    def setName(self, string, nameID, platformID, platEncID, langID):
+    def setName(
+        self,
+        string,
+        nameID,
+        platformID,
+        platEncID,
+        langID,
+        langTag=None,
+    ):
         """Set the 'string' for the name record identified by 'nameID', 'platformID',
         'platEncID' and 'langID'. If a record with that nameID doesn't exist, create it
         and append to the name table.
@@ -202,6 +641,9 @@ class table__n_a_m_e(DefaultTable.DefaultTable):
         it is assumed to be already encoded with the correct plaform-specific encoding
         identified by the (platformID, platEncID, langID) triplet. A warning is issued
         to prevent unexpected results.
+
+        The optional 'langTag' sets the format 1 BCP 47 tag text on the
+        record; callers normally pair it with a ``langID >= 0x8000``.
         """
         if not isinstance(string, str):
             if isinstance(string, bytes):
@@ -217,7 +659,17 @@ class table__n_a_m_e(DefaultTable.DefaultTable):
         if namerecord:
             namerecord.string = string
         else:
-            self.names.append(makeName(string, nameID, platformID, platEncID, langID))
+            namerecord = makeName(string, nameID, platformID, platEncID, langID)
+            self.names.append(namerecord)
+        if langTag is not None:
+            namerecord.langTag = langTag
+            if langID >= LANGUAGE_TAG_INDEX_BASE:
+                index = langID - LANGUAGE_TAG_INDEX_BASE
+                while len(self.langTags) <= index:
+                    self.langTags.append(None)
+                if self.langTags[index] is None:
+                    self.langTags[index] = LangTagRecord(langTag)
+        return namerecord
 
     def removeNames(self, nameID=None, platformID=None, platEncID=None, langID=None):
         """Remove any name records identified by the given combination of 'nameID',
@@ -419,7 +871,7 @@ class table__n_a_m_e(DefaultTable.DefaultTable):
         return nameID
 
 
-def makeName(string, nameID, platformID, platEncID, langID):
+def makeName(string, nameID, platformID, platEncID, langID, langTag=None):
     name = NameRecord()
     name.string, name.nameID, name.platformID, name.platEncID, name.langID = (
         string,
@@ -428,6 +880,8 @@ def makeName(string, nameID, platformID, platEncID, langID):
         platEncID,
         langID,
     )
+    if langTag is not None:
+        name.langTag = langTag
     return name
 
 
@@ -504,7 +958,160 @@ def _makeMacName(name, nameID, language, font=None):
         return None
 
 
+class LangTagRecord(str):
+    """A format 1 'name' table LangTagRecord: one BCP 47 language tag.
+
+    The object behaves as the tag string itself, so comparisons such as
+    ``table.langTags[0] == "en"`` work and a list of records compares
+    equal to a list of strings. It also keeps the binary ``length`` and
+    ``offset`` (and their ``langTagOffset`` alias) fields plus the raw
+    UTF-16BE :attr:`string` bytes after decompilation.
+    """
+
+    def __new__(
+        cls,
+        langTag=None,
+        tag=None,
+        string=None,
+        length=None,
+        offset=None,
+        langTagOffset=None,
+    ):
+        text = cls._coerceText(langTag if langTag is not None else tag, string)
+        return super().__new__(cls, text)
+
+    def __init__(
+        self,
+        langTag=None,
+        tag=None,
+        string=None,
+        length=None,
+        offset=None,
+        langTagOffset=None,
+    ):
+        text = self._coerceText(langTag if langTag is not None else tag, string)
+        self._langTag = text
+        # Binary fields, populated while decompiling/compiling.
+        self.length = length
+        offsetValue = offset if offset is not None else langTagOffset
+        self.offset = offsetValue
+        self.langTagOffset = offsetValue
+        if string is not None:
+            self.string = string
+        elif text:
+            self.string = tobytes(text, encoding="utf_16_be")
+        else:
+            self.string = b""
+
+    @staticmethod
+    def _coerceText(value, string=None):
+        if value is None and string is not None:
+            value = string
+        if value is None:
+            return ""
+        if isinstance(value, bytes):
+            return value.decode("utf-16-be")
+        return str(value)
+
+    @property
+    def langTag(self):
+        """The BCP 47 tag text (also available as :attr:`tag`)."""
+        return self._langTag
+
+    @langTag.setter
+    def langTag(self, value):
+        self._langTag = self._coerceText(value)
+
+    @property
+    def tag(self):
+        return self._langTag
+
+    @tag.setter
+    def tag(self, value):
+        self.langTag = value
+
+    @property
+    def langTagOffset(self):
+        """Spec-name alias for the binary :attr:`offset` field."""
+        return self.offset
+
+    @langTagOffset.setter
+    def langTagOffset(self, value):
+        self.offset = value
+
+    @property
+    def langTagLength(self):
+        """Spec-name alias for the binary :attr:`length` field."""
+        return self.length
+
+    @langTagLength.setter
+    def langTagLength(self, value):
+        self.length = value
+
+    def toUnicode(self, errors: str = "strict") -> str:
+        return self._langTag
+
+    def toBytes(self, errors: str = "strict") -> bytes:
+        # Format 1 language-tag strings are always UTF-16BE.
+        return tobytes(self._langTag, encoding="utf_16_be", errors=errors)
+
+    toStr = toUnicode
+
+    def __str__(self):
+        return self._langTag
+
+    def __repr__(self):
+        return "LangTagRecord(%r)" % self._langTag
+
+    def __eq__(self, other):
+        if isinstance(other, LangTagRecord):
+            return self._langTag == other._langTag
+        if isinstance(other, str):
+            return self._langTag == other
+        return NotImplemented
+
+    def __ne__(self, other):
+        result = self.__eq__(other)
+        if result is NotImplemented:
+            return result
+        return not result
+
+    def __hash__(self):
+        return hash(self._langTag)
+
+
 class NameRecord(object):
+    # For format 1 records whose langID >= 0x8000, this holds the
+    # referenced BCP 47 tag text. It stays None for ordinary platform
+    # language IDs.
+    langTag = None
+
+    @property
+    def languageTag(self):
+        """Alias for :attr:`langTag`, the resolved format 1 BCP 47 tag."""
+        return self.langTag
+
+    @languageTag.setter
+    def languageTag(self, value):
+        self.langTag = value
+
+    @property
+    def lang_tag(self):
+        """Snake-case alias for :attr:`langTag`."""
+        return self.langTag
+
+    @lang_tag.setter
+    def lang_tag(self, value):
+        self.langTag = value
+
+    @property
+    def language(self):
+        return self.langTag
+
+    @language.setter
+    def language(self, value):
+        self.langTag = value
+
     def getEncoding(self, default="ascii"):
         """Returns the Python encoding name for this name entry based on its platformID,
         platEncID, and langID.  If encoding for these values is not known, by default
@@ -615,6 +1222,22 @@ class NameRecord(object):
             ("langID", hex(self.langID)),
         ]
 
+        # Format 1 language-tag reference. Only 0x8000+ langIDs carry a
+        # BCP 47 tag here; ordinary platform language IDs stay numeric.
+        langTag = getattr(self, "langTag", None)
+        if (
+            not langTag
+            and self.langID >= LANGUAGE_TAG_INDEX_BASE
+            and ttFont is not None
+            and "name" in ttFont
+        ):
+            try:
+                langTag = ttFont["name"].getLangTag(self.langID)
+            except (ttLib.TTLibError, KeyError):
+                langTag = None
+        if langTag:
+            attrs.append(("langTag", str(langTag)))
+
         if unistr is None or not self.encodingIsUnicodeCompatible():
             attrs.append(("unicode", unistr is not None))
 
@@ -633,6 +1256,22 @@ class NameRecord(object):
         self.platformID = safeEval(attrs["platformID"])
         self.platEncID = safeEval(attrs["platEncID"])
         self.langID = safeEval(attrs["langID"])
+        # Optional format 1 BCP 47 language tag, accepted under the
+        # likely attribute spellings.
+        self.langTag = None
+        for attrName in (
+            "langTag",
+            "langtag",
+            "languageTag",
+            "bcp47Tag",
+            "bcp47",
+            "language",
+            "lang",
+            "tag",
+        ):
+            if attrName in attrs:
+                self.langTag = attrs[attrName]
+                break
         s = strjoin(content).strip()
         encoding = self.getEncoding()
         if self.encodingIsUnicodeCompatible() or safeEval(

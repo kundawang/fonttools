@@ -208,6 +208,10 @@ ttLib.getTableClass("vmtx").mergeMap = ttLib.getTableClass("hmtx").mergeMap = {
 ttLib.getTableClass("name").mergeMap = {
     "tableTag": equal,
     "names": first,  # FIXME? Does mixing name records make sense?
+    # The format 1 language-tag array belongs to the name records; keep
+    # it from the same first table as ``names``.
+    "langTags": first,
+    "format": first,
 }
 
 ttLib.getTableClass("loca").mergeMap = {
